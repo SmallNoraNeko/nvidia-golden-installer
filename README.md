@@ -26,7 +26,7 @@ into one self-contained binary for air-gapped ARM64 deployments.
 
 <div align="center">
 
-https://github.com/SmallNoraNeko/nvidia-golden-installer/releases/download/v1.0/No_Internet_No_Extension_One_Command.mp4
+![Demo](https://github.com/SmallNoraNeko/nvidia-golden-installer/releases/download/v1.0/demo.gif)
 
 ▶ *No internet. No browser extension. One command.*
 
