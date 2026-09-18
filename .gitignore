@@ -1,0 +1,22 @@
+# Source installer files — never commit these
+*.run
+*.deb
+
+# Build artifacts
+_payload/
+_gpu_payload.enc
+_gpu_installer_src.py
+gpu_installer
+nvidia-golden-*
+
+# Logs
+*.log
+packager_*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
