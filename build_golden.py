@@ -13,6 +13,7 @@ Build machine requirements:
   - Python 3.10+
   - pip install cryptography nuitka --break-system-packages
   - sudo apt install -y makeself patchelf
+  - _core.py  (encryption & compilation core — not distributed)
 
 Usage:
   # Option A — environment variables (recommended for CI/CD)
@@ -37,9 +38,35 @@ On target machine:
 import os
 import sys
 import shutil
-import secrets
 import subprocess
 import textwrap
+
+# ── Core encryption & compilation pipeline ───────────────────
+# encrypt_gpu_payload, generate_gpu_installer_src, compile_gpu_installer
+# are implemented in _core.py, which is NOT included in this repository.
+#
+# _core.py contains the AES-256-GCM key derivation, embedded-key
+# source generation, and Nuitka --onefile compilation logic.
+# Without it, this script will exit with an informative error.
+try:
+    from _core import (
+        encrypt_gpu_payload,
+        generate_gpu_installer_src,
+        compile_gpu_installer,
+    )
+except ImportError:
+    print()
+    print("  ╔══════════════════════════════════════════════════════╗")
+    print("  ║   _core.py not found — build cannot proceed.        ║")
+    print("  ║                                                      ║")
+    print("  ║   This repository is a framework reference only.    ║")
+    print("  ║   The encryption & compilation core is not          ║")
+    print("  ║   distributed as part of this public repository.    ║")
+    print("  ╚══════════════════════════════════════════════════════╝")
+    print()
+    sys.exit(1)
+# ─────────────────────────────────────────────────────────────
+
 
 # ── Config (env vars override fallback defaults) ──────────────
 #
@@ -57,19 +84,8 @@ OUTPUT_NAME = os.environ.get("OUTPUT_NAME", "nvidia-golden-aarch64")
 # e.g. "13.0"  →  skips CUDA if nvcc reports "release 13.0"
 CUDA_SKIP_VERSION = os.environ.get("CUDA_SKIP_VERSION", "13.0")
 
-GPU_INSTALL_FLAGS = [
-    "--silent",
-    "--accept-license",
-    "--no-questions",
-    "--dkms",
-    "--kernel-module-type=open",
-    "--no-install-libglvnd",
-    "--no-opengl-files",
-]
-
 # Internal temp names
 _GPU_PAYLOAD    = "_gpu_payload.enc"
-_GPU_SRC        = "_gpu_installer_src.py"
 _GPU_BIN        = "gpu_installer"
 _PAYLOAD_DIR    = "_payload"
 # ─────────────────────────────────────────────────────────────
@@ -139,142 +155,6 @@ def check_build_env():
         sys.exit(1)
 
 
-def encrypt_gpu_payload() -> tuple[str, str]:
-    """AES-256-GCM encrypt the GPU .run file. Returns (key_hex, nonce_hex)."""
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-    _banner("Step 1/6  Encrypting GPU driver payload")
-
-    print(f"  Reading  : {GPU_RUN}")
-    with open(GPU_RUN, "rb") as f:
-        raw = f.read()
-    print(f"  Size     : {len(raw):,} bytes ({len(raw)//1024//1024} MB)")
-
-    key   = secrets.token_bytes(32)
-    nonce = secrets.token_bytes(12)
-    enc   = AESGCM(key).encrypt(nonce, raw, None)
-    del raw
-
-    with open(_GPU_PAYLOAD, "wb") as f:
-        f.write(enc)
-    print(f"  Encrypted: {_GPU_PAYLOAD}  ({len(enc)//1024//1024} MB)")
-
-    return key.hex(), nonce.hex()
-
-
-def generate_gpu_installer_src(key_hex: str, nonce_hex: str):
-    """Generate the gpu_installer Python source with AES key embedded."""
-    _banner("Step 2/6  Generating gpu_installer source")
-
-    flags_repr = repr(GPU_INSTALL_FLAGS)
-
-    src = textwrap.dedent(f'''\
-        #!/usr/bin/env python3
-        # -*- coding: utf-8 -*-
-        """
-        GPU Driver Decryptor + Installer
-        AES-256-GCM key is compiled into this binary via Nuitka.
-        """
-        import os, sys, stat, secrets, tempfile, subprocess
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-
-        _K = bytes.fromhex("{key_hex}")
-        _N = bytes.fromhex("{nonce_hex}")
-        _F = {flags_repr}
-        _P = "{_GPU_PAYLOAD}"
-
-        def _find_payload():
-            for base in [
-                os.path.dirname(os.path.abspath(sys.argv[0])),
-                os.path.dirname(os.path.abspath(__file__)),
-                os.getcwd(),
-            ]:
-                p = os.path.join(base, _P)
-                if os.path.isfile(p):
-                    return p
-            return None
-
-        def main():
-            if os.geteuid() != 0:
-                sys.exit("[!] gpu_installer must be run as root")
-
-            path = _find_payload()
-            if not path:
-                sys.exit(f"[!] Encrypted payload not found: {{_P}}")
-
-            print("[*] Decrypting GPU driver payload ...")
-            with open(path, "rb") as f:
-                enc = f.read()
-
-            try:
-                raw = AESGCM(_K).decrypt(_N, enc, None)
-            except Exception:
-                sys.exit("[!] Decryption failed — file may be tampered")
-            del enc
-
-            tmp_dir  = tempfile.mkdtemp(prefix=".gpu_")
-            tmp_exec = os.path.join(tmp_dir, secrets.token_hex(10))
-            try:
-                with open(tmp_exec, "wb") as f:
-                    f.write(raw)
-                del raw
-                os.chmod(tmp_exec, stat.S_IRWXU)
-
-                print("[*] Running NVIDIA GPU driver installer ...")
-                print("    (This may take 3-10 minutes for kernel module compilation)")
-                ret = subprocess.run([tmp_exec] + _F).returncode
-            finally:
-                try: os.unlink(tmp_exec)
-                except Exception: pass
-                try: os.rmdir(tmp_dir)
-                except Exception: pass
-
-            if ret != 0:
-                sys.exit(
-                    f"[!] GPU driver installation failed (exit {{ret}})\\n"
-                    f"    Log: /var/log/nvidia-installer.log"
-                )
-            print("[+] GPU driver installed successfully.")
-            sys.exit(0)
-
-        if __name__ == "__main__":
-            main()
-    ''')
-
-    with open(_GPU_SRC, "w", encoding="utf-8") as f:
-        f.write(src)
-    print(f"  Generated: {_GPU_SRC}")
-
-
-def compile_gpu_installer():
-    """Compile gpu_installer with Nuitka (onefile, encrypted payload embedded)."""
-    _banner("Step 3/6  Compiling gpu_installer with Nuitka")
-
-    cmd = [
-        sys.executable, "-m", "nuitka",
-        "--onefile",
-        f"--output-filename={_GPU_BIN}",
-        f"--include-data-files={_GPU_PAYLOAD}={_GPU_PAYLOAD}",
-        "--include-module=_cffi_backend",
-        "--remove-output",
-        "--assume-yes-for-downloads",
-        _GPU_SRC,
-    ]
-
-    print(f"  Command: {' '.join(cmd)}\n")
-    result = subprocess.run(cmd)
-
-    for f in [_GPU_SRC]:
-        try: os.unlink(f)
-        except Exception: pass
-
-    if result.returncode != 0:
-        sys.exit("[!] Nuitka compilation failed.")
-
-    size = os.path.getsize(_GPU_BIN)
-    print(f"  Output : {_GPU_BIN}  ({size//1024//1024} MB)")
-
-
 def prepare_payload_dir():
     """Assemble payload directory with all components."""
     _banner("Step 4/6  Assembling payload directory")
@@ -289,7 +169,6 @@ def prepare_payload_dir():
     print(f"  [✓] {_GPU_BIN}  (encrypted GPU driver)")
 
     # _gpu_payload.enc — needed by gpu_installer at runtime
-    # Note: Nuitka onefile embeds it, so we also keep it beside binary for redundancy
     shutil.copy2(_GPU_PAYLOAD, os.path.join(_PAYLOAD_DIR, _GPU_PAYLOAD))
     print(f"  [✓] {_GPU_PAYLOAD}  (AES-256-GCM encrypted payload)")
 
@@ -308,7 +187,6 @@ def generate_install_sh():
     """Generate the main install.sh inside the payload directory."""
     _banner("Step 5/6  Generating install.sh")
 
-    # Use raw string to avoid Python f-string collision with bash ${...}
     script = r"""#!/bin/bash
 # =============================================================
 # Golden Triangle Auto-Installer v5.0
@@ -349,7 +227,7 @@ echo -e "${RESET}"
 
 # ── Root check ────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
-    log_error "Must be run as root:  sudo ./nvidia-golden-gb300-sbsa"  # replaced at build time
+    log_error "Must be run as root:  sudo ./nvidia-golden-gb300-sbsa"
     exit 1
 fi
 
@@ -372,7 +250,6 @@ NVIDIA_APT_PKGS=$(dpkg -l 2>/dev/null | grep -E "^ii.*nvidia" | awk '{print $2}'
 if [ -n "$NVIDIA_APT_PKGS" ]; then
     log_info "Detected deb-based installation → running apt purge ..."
 
-    # Detect old major version number (e.g. 580, 535)
     OLD_VER=$(echo "$NVIDIA_APT_PKGS" | grep -oP 'nvidia[^0-9]*\K[0-9]{3,}' \
               | sort -rn | head -n1 || echo "")
 
@@ -396,7 +273,6 @@ if [ -n "$NVIDIA_APT_PKGS" ]; then
             2>/dev/null || true
     fi
 
-    # Remove local repo packages
     OLD_REPO=$(dpkg -l 2>/dev/null | grep "nvidia-driver-local-repo" | awk '{print $2}' || true)
     if [ -n "$OLD_REPO" ]; then
         DEBIAN_FRONTEND=noninteractive apt-get purge -y $OLD_REPO 2>/dev/null || true
@@ -406,7 +282,6 @@ if [ -n "$NVIDIA_APT_PKGS" ]; then
 
     DEBIAN_FRONTEND=noninteractive apt-get autoremove --purge -y 2>/dev/null || true
 
-    # Clear rc-state residuals
     RC_PKGS=$(dpkg -l 2>/dev/null | grep '^rc' | grep -i nvidia | awk '{print $2}' || true)
     [ -n "$RC_PKGS" ] && echo "$RC_PKGS" | xargs dpkg --purge 2>/dev/null || true
 
@@ -435,7 +310,6 @@ rm -rf /var/lib/nvidia/ 2>/dev/null || true
 rm -f /usr/lib/aarch64-linux-gnu/libnvidia* 2>/dev/null || true
 rm -f /usr/lib/aarch64-linux-gnu/libGL*nvidia* 2>/dev/null || true
 
-# Unload nvidia kernel module if loaded
 rmmod nvidia_drm  2>/dev/null || true
 rmmod nvidia_modeset 2>/dev/null || true
 rmmod nvidia_uvm  2>/dev/null || true
@@ -469,7 +343,6 @@ log_step "Step 3/5  CUDA 13.0.2 (auto-skip if already installed)"
 
 CUDA_SKIP=false
 
-# Check 1: nvcc version
 if command -v nvcc &>/dev/null; then
     NVCC_VER=$(nvcc --version 2>/dev/null | grep -oP "release \K[0-9]+\.[0-9]+" || echo "")
     if [ "$NVCC_VER" = "CUDA_SKIP_VERSION_PLACEHOLDER" ]; then
@@ -478,7 +351,6 @@ if command -v nvcc &>/dev/null; then
     fi
 fi
 
-# Check 2: directory exists
 if [ "$CUDA_SKIP" = false ] && [ -d "/usr/local/cuda-13.0" ]; then
     CUDA_SKIP=true
     log_ok "CUDA 13.0 already installed (/usr/local/cuda-13.0 exists) — skipping ✓"
@@ -495,19 +367,10 @@ if [ "$CUDA_SKIP" = false ]; then
     log_info "Installing CUDA Toolkit (this takes 3-5 minutes) ..."
     "$CUDA_INSTALLER" --silent --toolkit 2>&1 | tee -a "$LOG_FILE"
 
-    if command -v nvcc &>/dev/null || [ -d "/usr/local/cuda-${_CUDA_VER}" ]; then
-        log_ok "CUDA ${_CUDA_VER} installed"
-    else
-        log_error "nvcc not found after CUDA install — check ${LOG_FILE}"
-        exit 1
-    fi
-
-    # Write global env vars
-    CUDA_DIR=$(ls -d /usr/local/cuda-${_CUDA_VER%.*}* 2>/dev/null | head -n1 || echo "/usr/local/cuda")
     cat > /etc/profile.d/cuda_env.sh << ENV_EOF
 # CUDA Environment — auto-generated by Golden Triangle Installer v5.0
-export PATH=\$PATH:${CUDA_DIR}/bin
-export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:${CUDA_DIR}/lib64
+export PATH=\$PATH:/usr/local/cuda/bin
+export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda/lib64
 ENV_EOF
     chmod 644 /etc/profile.d/cuda_env.sh
     log_ok "CUDA environment variables written to /etc/profile.d/cuda_env.sh"
@@ -526,14 +389,12 @@ fi
 log_info "Installing DOCA local repo package ..."
 dpkg -i "$DOCA_DEB_FILE"
 
-# Copy GPG key
 DOCA_KEY=$(find /var/doca-host-repo-* /var/doca-repo-* -name "*.gpg" 2>/dev/null | head -n1 || true)
 if [ -n "$DOCA_KEY" ]; then
     cp "$DOCA_KEY" /usr/share/keyrings/
     log_ok "DOCA GPG key installed"
 fi
 
-# Set up sources.list for local repo
 DOCA_REPO_DIR=$(ls -d /var/doca-host-repo-* /var/doca-repo-* 2>/dev/null | head -n1 || true)
 if [ -n "$DOCA_REPO_DIR" ]; then
     echo "deb [trusted=yes] file:${DOCA_REPO_DIR} ./" \
@@ -576,7 +437,6 @@ if dpkg -l 2>/dev/null | grep -qE "^ii.*nvidia.*(open|driver|dkms)"; then
     log_ok "GPU packages installed: ${GPU_PKG}"
 else
     log_warn "GPU packages not visible via dpkg (installed via .run — expected)"
-    # Still check if nvidia-smi binary exists
     if [ -f "/usr/bin/nvidia-smi" ]; then
         log_ok "/usr/bin/nvidia-smi present ✓"
     else
@@ -602,7 +462,7 @@ fi
 
 echo ""
 echo -e "▶ [3/4] CUDA"
-export PATH=$PATH:/usr/local/cuda-${_CUDA_VER}/bin:/usr/local/cuda/bin
+export PATH=$PATH:/usr/local/cuda/bin
 if command -v nvcc &>/dev/null; then
     NVCC_V=$(nvcc --version 2>/dev/null | grep "release" | head -n1)
     log_ok "${NVCC_V}"
@@ -622,22 +482,18 @@ echo ""
 log_info "Updating initramfs for new driver modules ..."
 update-initramfs -u 2>/dev/null || log_warn "update-initramfs had warnings"
 
-# ── 清除離線 APT source（防止之後 apt update 跳錯）──────────────
 rm -f /etc/apt/sources.list.d/doca-offline.list 2>/dev/null || true
 rm -f /etc/apt/sources.list.d/nvidia-unified-offline.list 2>/dev/null || true
 rm -f /etc/apt/sources.list.d/nvidia-driver-local*.list 2>/dev/null || true
 log_ok "Offline APT sources removed"
 
-# ── Self-delete ───────────────────────────────────────────────
 log_info "Removing installer files ..."
-# Try to delete the original makeself archive
 for _candidate in "${MAKESELF_ARCHIVE:-}" "${ARCHIVE:-}" "${MAKESELF_SELF:-}"; do
     if [ -n "$_candidate" ] && [ -f "$_candidate" ]; then
         rm -f "$_candidate" && log_ok "Installer deleted: ${_candidate}" && break
     fi
 done
 
-# ── Final result ─────────────────────────────────────────────
 echo ""
 if [ "$PASS" = true ]; then
     echo -e "${GREEN}${BOLD}"
@@ -677,7 +533,6 @@ else
 fi
 """
 
-    # Inject runtime config values into the shell script placeholders
     script = script.replace("CUDA_SKIP_VERSION_PLACEHOLDER", CUDA_SKIP_VERSION)
     script = script.replace("nvidia-golden-gb300-sbsa", OUTPUT_NAME)
 
@@ -707,7 +562,6 @@ def makeself_package():
     if result.returncode != 0:
         sys.exit("[!] makeself packaging failed.")
 
-    # Make executable (makeself should already do this, but ensure)
     os.chmod(OUTPUT_NAME, 0o755)
 
     size = os.path.getsize(OUTPUT_NAME)
@@ -734,7 +588,7 @@ def main():
     print("  ╚══════════════════════════════════════════════════════╝")
 
     check_build_env()
-    key_hex, nonce_hex = encrypt_gpu_payload()
+    key_hex, nonce_hex = encrypt_gpu_payload(GPU_RUN)
     generate_gpu_installer_src(key_hex, nonce_hex)
     compile_gpu_installer()
     prepare_payload_dir()

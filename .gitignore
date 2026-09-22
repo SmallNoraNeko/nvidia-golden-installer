@@ -1,3 +1,6 @@
+# Encryption & compilation core — not distributed
+_core.py
+
 # Source installer files — never commit these
 *.run
 *.deb
